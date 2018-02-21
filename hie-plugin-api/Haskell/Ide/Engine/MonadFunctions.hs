@@ -20,7 +20,10 @@ import Data.Typeable
 import Data.Dynamic
 import qualified Data.Map as Map
 
-import Haskell.Ide.Engine.MonadTypes
+-- import Haskell.Ide.Engine.MonadTypes
+import Haskell.Ide.Engine.MultiThreadState
+import Haskell.Ide.Engine.PluginsIdeMonads
+
 -- ---------------------------------------------------------------------
 
 logm :: MonadIO m => String -> m ()

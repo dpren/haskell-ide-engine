@@ -23,7 +23,7 @@ import Haskell.Ide.Engine.GhcModuleCache
 
 import           System.Directory
 import           System.FilePath
-
+import           Haskell.Ide.Engine.MonadFunctions (debugm)
 
 modifyCache :: (HasGhcModuleCache m) => (GhcModuleCache -> GhcModuleCache) -> m ()
 modifyCache f = do
@@ -113,8 +113,11 @@ withCachedModuleAndData uri noCache callback = do
     Just UriCache{cachedModule = cm, cachedData = dat} -> do
       let proxy :: Proxy a
           proxy = Proxy
+      debugm $ "$$$$$ UriCache: " 
+      debugm $ "         proxy: " ++ show (typeRep proxy)
       a <- case Map.lookup (typeRep proxy) dat of
              Nothing -> do
+               debugm $ "$$$$$ - Nothing, produce"
                val <- cacheDataProducer cm
                let dat' = Map.insert (typeOf val) (toDyn val) dat
                modifyCache (\s -> s {uriCaches = Map.insert uri' (UriCache cm dat')
@@ -122,7 +125,9 @@ withCachedModuleAndData uri noCache callback = do
                return val
              Just x ->
                case fromDynamic x of
-                 Just val -> return val
+                 Just val -> do
+                    debugm $ "$$$$$ - Just" -- ++ show val
+                    return val
                  Nothing  -> error "impossible"
       callback cm a
 

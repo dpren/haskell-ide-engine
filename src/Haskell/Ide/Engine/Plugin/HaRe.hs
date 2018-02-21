@@ -4,6 +4,8 @@
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+-- {-# LANGUAGE FlexibleInstances #-}
+-- {-# LANGUAGE TypeSynonymInstances #-}
 module Haskell.Ide.Engine.Plugin.HaRe where
 
 import           ConLike
@@ -14,9 +16,11 @@ import           Data.Aeson
 import qualified Data.Aeson.Types                             as J
 import           Data.Algorithm.Diff
 import           Data.Algorithm.DiffOutput
+import           Data.Bifunctor
 import           Data.Either
 import           Data.Foldable
 import           Data.IORef
+import qualified Data.List
 import qualified Data.Map                                     as Map
 import           Data.Maybe
 import           Data.Monoid
@@ -413,65 +417,176 @@ safeTyThingId (AnId i)                    = Just i
 safeTyThingId (AConLike (RealDataCon dc)) = Just $ dataConWrapId dc
 safeTyThingId _                           = Nothing
 
+
+-- available completions in scope
+data CachedCompletions = CC
+  { unqualCompls :: [CompItem]
+  , importDeclerations :: [ImportDecl Name]
+  , allModNamesAsGiven :: [T.Text]
+  , cachedLocalCmps :: [CompItem]
+  , cachedQualifiedModNames :: [ModuleName]
+  , cachedUnqualifiedModNames :: [ModuleName]
+  } deriving (Typeable)
+
+-- {-
+
+instance ModuleCache CachedCompletions where
+  -- cacheDataProducer :: CachedModule -> m CachedCompletions
+  cacheDataProducer cm = do
+    let tm = tcMod cm
+        parsedMod = tm_parsed_module tm
+        curMod = moduleName $ ms_mod $ pm_mod_summary parsedMod
+        Just (_,limports,_,_) = tm_renamed_source tm
+        -- Full canonical names of imported modules
+        importDeclerations = map unLoc limports
+
+        typeEnv = md_types $ snd $ tm_internals_ tm
+        localVars = mapMaybe safeTyThingId $ typeEnvElts typeEnv
+        varToLocalCmp var = CI name (showModName curMod) typ label
+          where
+            typ = Just $ T.pack $ showGhc $ varType var
+            name = Var.varName var
+            label = T.pack $ showGhc name
+        
+        localCmps = map varToLocalCmp localVars
+
+        -- The given namespaces for the imported modules (ie. full name, or alias if used)
+        allModNamesAsGiven = map (showModName . pickNamespace) importDeclerations
+
+        --                  qual          unqual
+        partitionedMods :: ([ModuleName], [ModuleName])
+        partitionedMods = bimap (map iDeclToModName) (map iDeclToModName)
+                      $ Data.List.partition ideclQualified importDeclerations
+
+        cachedQualifiedModNames = fst partitionedMods
+        cachedUnqualifiedModNames = snd partitionedMods
+
+        getComplsFromModName :: GhcMonad m
+          => ModuleName -> m (Set.Set CompItem)
+        getComplsFromModName mn = do
+          mminf <- getModuleInfo =<< findModule mn Nothing
+          return $ case mminf of
+            Nothing -> Set.empty
+            Just minf ->
+              Set.fromList $ map (modNameToCompItem mn) $ modInfoExports minf
+
+        -- setCiTypesForImported :: (Traversable t, MonadIO m) => Maybe HscEnv -> t CompItem -> m (t CompItem)
+        -- lookup up and set the thingType
+        setCiTypesForImported Nothing xs = liftIO $ pure xs
+        setCiTypesForImported (Just hscEnv) xs =
+          liftIO $ forM xs $ \ci@CI{origName} -> do
+            mt <- (Just <$> lookupGlobal hscEnv origName)
+                    `catch` \(_ :: SourceError) -> return Nothing
+            let typ = do
+                  t <- mt
+                  tyid <- safeTyThingId t
+                  return $ T.pack $ showGhc $ varType tyid
+            return $ ci {thingType = typ}
+
+    unqualCompls <- do
+      hscEnvRef <- ghcSession <$> readMTS
+      hscEnv <- liftIO $ traverse readIORef hscEnvRef
+      let getComplsGhc = maybe (const $ pure Set.empty) (\env -> GM.runLightGhc env . getComplsFromModName) hscEnv
+      withoutTypes <- Set.toList . Set.unions <$> mapM getComplsGhc cachedUnqualifiedModNames
+      unqualCompls <- setCiTypesForImported hscEnv withoutTypes
+      return unqualCompls
+    
+    debugm $ "CC ##### "
+
+    return $ CC 
+      { unqualCompls = unqualCompls
+
+      , importDeclerations = importDeclerations
+
+      , allModNamesAsGiven  = allModNamesAsGiven
+      , cachedLocalCmps = localCmps
+      , cachedQualifiedModNames = cachedQualifiedModNames
+      , cachedUnqualifiedModNames = cachedUnqualifiedModNames
+      }
+
+
+
+
+--}
+
+iDeclToModName :: ImportDecl name -> ModuleName
+iDeclToModName = unLoc . ideclName
+
+showModName :: ModuleName -> T.Text
+showModName = T.pack . moduleNameString
+
+modNameToCompItem :: ModuleName -> Name -> CompItem
+modNameToCompItem mn n =
+  CI n (showModName mn) Nothing (T.pack $ showGhc n)
+
+#if __GLASGOW_HASKELL__ >= 802
+pickNamespace :: ImportDecl name -> ModuleName
+pickNamespace imp = fromMaybe (iDeclToModName imp) (fmap GHC.unLoc $ ideclAs imp)
+#else
+pickNamespace :: ImportDecl name -> ModuleName
+pickNamespace imp = fromMaybe (iDeclToModName imp) (ideclAs imp)
+#endif
+
+
 getCompletions :: Uri -> (T.Text, T.Text) -> IdeM (IdeResponse [J.CompletionItem])
-getCompletions uri (qualifier,ident) = pluginGetFile "getCompletions: " uri $ \file ->
+getCompletions uri (qualifier, ident) = pluginGetFile "getCompletions: " uri $ \file ->
   let handlers  = [GM.GHandler $ \(ex :: SomeException) ->
                      return $ someErr "getCompletions" (show ex)
                   ] in
   flip GM.gcatches handlers $ do
-  debugm $ "got prefix" ++ show (qualifier,ident)
+  debugm $ "got prefix" ++ show (qualifier, ident)
   let noCache = return $ nonExistentCacheErr "getCompletions"
   let modQual = if T.null qualifier then "" else qualifier <> "."
   let fullPrefix = modQual <> ident
-  withCachedModule file noCache $
-    \cm -> do
-      let tm = tcMod cm
-          parsedMod = tm_parsed_module tm
-          curMod = moduleName $ ms_mod $ pm_mod_summary parsedMod
-          Just (_,limports,_,_) = tm_renamed_source tm
-          imports = map unLoc limports
-          typeEnv = md_types $ snd $ tm_internals_ tm
-
-          localVars = mapMaybe safeTyThingId $ typeEnvElts typeEnv
-          localCmps = getCompls $ map varToLocalCmp localVars
-          varToLocalCmp var = CI name (showMod curMod) typ label
-            where typ = Just $ T.pack $ showGhc $ varType var
-                  name = Var.varName var
-                  label = T.pack $ showGhc name
-
-          importMn = unLoc . ideclName
-          showMod = T.pack . moduleNameString
-          nameToCompItem mn n =
-            CI n (showMod mn) Nothing $ T.pack $ showGhc n
-
-          getCompls = filter ((ident `T.isPrefixOf`) . label)
-
-#if __GLASGOW_HASKELL__ >= 802
-          pickName imp = fromMaybe (importMn imp) (fmap GHC.unLoc $ ideclAs imp)
-#else
-          pickName imp = fromMaybe (importMn imp) (ideclAs imp)
-#endif
-
-          allModules = map (showMod . pickName) imports
-          modCompls = map mkModCompl
+  withCachedModuleAndData file noCache $
+    \_ CC{allModNamesAsGiven
+        , unqualCompls
+        , importDeclerations
+        , cachedLocalCmps
+        -- , cachedUnqualifiedModNames
+      } -> do
+      let filterComplsByIdent = filter ((ident `T.isPrefixOf`) . label)
+          
+          -- G:
+          --  [CI { _label = "GM", _kind = Just CiModule, _... = Nothing }]
+          --  [CI { _label = "GHC.Generics", _kind = Just CiModule, _... = Nothing }]
+          modNameCompls = map mkModCompl
                     $ mapMaybe (T.stripPrefix $ modQual)
-                    $ filter (fullPrefix `T.isPrefixOf`) allModules
+                    $ filter (fullPrefix `T.isPrefixOf`) allModNamesAsGiven
 
-          unqualImports :: [ModuleName]
-          unqualImports = map importMn
-                        $ filter (not . ideclQualified) imports
 
-          relevantImports :: [(ModuleName, Maybe (Bool, [Name]))]
-          relevantImports
+          -- if qualifier, we only need to return items under that namespace
+          qualifiedModNames :: [(ModuleName, Maybe (Bool, [Name]))]
+          qualifiedModNames
             | T.null qualifier = []
-            | otherwise = mapMaybe f imports
-              where f imp = do
-                      let mn = importMn imp
-                      guard (showMod (pickName imp) == qualifier)
+            | otherwise = mapMaybe func importDeclerations
+              where func imp = do
+                      let modName = iDeclToModName imp
+                      -- allModNamesAsGiven == qualifier
+                      guard (showModName (pickNamespace imp) == qualifier)
                       case ideclHiding imp of
-                        Nothing -> return (mn,Nothing)
-                        Just (b,L _ liens) ->
-                          return (mn, Just (b, concatMap (ieNames . unLoc) liens))
+                        Nothing ->
+                          return (modName, Nothing)
+                        Just (hasHiddens, L _ liens) ->
+                          return (modName, Just (hasHiddens, concatMap (ieNames . unLoc) liens))
+
+          getQualifedCompls :: GhcMonad m => m (Set.Set CompItem)
+          getQualifedCompls = do
+            xs <- forM qualifiedModNames $
+              -- :: m (Set.Set CompItem)
+              \(modName, mie) ->
+                case mie of
+                  --           names == members
+                  Just (False, names) ->
+                    return $ Set.fromList $ filterComplsByIdent $ map (modNameToCompItem modName) names
+                  Just (True , names) -> do
+                    compls <- getComplsFromModName modName
+                    let hiddens = Set.fromList $ filterComplsByIdent $ map (modNameToCompItem modName) names
+                    -- compls without hiddens
+                    return $ Set.difference compls hiddens
+                  Nothing ->
+                    getComplsFromModName modName
+            return $ Set.unions xs
 
           getComplsFromModName :: GhcMonad m
             => ModuleName -> m (Set.Set CompItem)
@@ -479,23 +594,9 @@ getCompletions uri (qualifier,ident) = pluginGetFile "getCompletions: " uri $ \f
             mminf <- getModuleInfo =<< findModule mn Nothing
             return $ case mminf of
               Nothing -> Set.empty
-              Just minf ->
-                Set.fromList $ getCompls $ map (nameToCompItem mn) $ modInfoExports minf
-
-          getQualifedCompls :: GhcMonad m => m (Set.Set CompItem)
-          getQualifedCompls = do
-            xs <- forM relevantImports $
-              \(mn, mie) ->
-                case mie of
-                  (Just (False, ns)) ->
-                    return $ Set.fromList $ getCompls $ map (nameToCompItem mn) ns
-                  (Just (True , ns)) -> do
-                    exps <- getComplsFromModName mn
-                    let hid = Set.fromList $ getCompls $ map (nameToCompItem mn) ns
-                    return $ Set.difference exps hid
-                  Nothing ->
-                    getComplsFromModName mn
-            return $ Set.unions xs
+              Just minf -> do
+                let z = map (modNameToCompItem mn) $ modInfoExports minf
+                Set.fromList $ filterComplsByIdent $ z
 
           setCiTypesForImported Nothing xs = liftIO $ pure xs
           setCiTypesForImported (Just hscEnv) xs =
@@ -508,19 +609,33 @@ getCompletions uri (qualifier,ident) = pluginGetFile "getCompletions: " uri $ \f
                     return $ T.pack $ showGhc $ varType tyid
               return $ ci {thingType = typ}
 
+      -- debugm $ "importDeclerations ~~~~~ " ++ show (map iDeclToModName importDeclerations)
+      -- debugm $ "allModNamesAsGiven ~~~~~ " ++ show allModNamesAsGiven
+      -- debugm $ "modNameCompls ~~~~~ " ++ show modNameCompls
+
       comps <- do
         hscEnvRef <- ghcSession <$> readMTS
         hscEnv <- liftIO $ traverse readIORef hscEnvRef
         if T.null qualifier then do
-          let getComplsGhc = maybe (const $ pure Set.empty) (\env -> GM.runLightGhc env . getComplsFromModName) hscEnv
-          xs <- Set.toList . Set.unions <$> mapM getComplsGhc unqualImports
-          xs' <- setCiTypesForImported hscEnv xs
-          return $ localCmps ++ xs'
+          -- let getComplsGhc = maybe (const $ pure Set.empty) (\env -> GM.runLightGhc env . getComplsFromModName) hscEnv
+          -- xs <- Set.toList . Set.unions <$> mapM getComplsGhc cachedUnqualifiedModNames
+          -- xs' <- setCiTypesForImported hscEnv xs
+          -- ALL UNQUALIFIED ^
+
+          return $ filterComplsByIdent (cachedLocalCmps ++ unqualCompls)
         else do
           let getQualComplsGhc = maybe (pure Set.empty) (\env -> GM.runLightGhc env getQualifedCompls) hscEnv
           xs <- Set.toList <$> getQualComplsGhc
           setCiTypesForImported hscEnv xs
-      return $ IdeResponseOk $ modCompls ++ map mkCompl comps
+          -- ALL QUALIFIED ^
+      
+      debugm $ "~~~~~ comps " ++ show comps
+
+      -- return $ IdeResponseOk $ const completionItems (modNameCompls ++ map mkCompl comps)
+      return $ IdeResponseOk $ modNameCompls ++ map mkCompl comps
+
+      -- return $ IdeResponseOk $ modNameCompls ++ map mkModCompl (const cachedLocalCmps (const comps fullPrefix))
+
 
 getTypeForName :: Name -> IdeM (Maybe Type)
 getTypeForName n = do
