@@ -378,7 +378,7 @@ data CompItem = CI
   , importedFrom :: T.Text
   , thingType    :: Maybe T.Text
   , label        :: T.Text
-  }
+  } deriving (Show)
 
 instance Eq CompItem where
   (CI n1 _ _ _) == (CI n2 _ _ _) = n1 == n2
